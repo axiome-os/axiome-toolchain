@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""
+axcc — AxiomeOS C compiler driver (GCC backend).
+Compiles C to AxiomeOS PIE ELFs without needing an axiomeOS checkout.
+
+Uses vendored SDK in ../sdk:
+  include/*.h  — libc headers
+  lib/crt0.o   — startup
+  lib/libc.sl  — shared libc (DT_NEEDED)
+  ldscripts/link.ld, libc.ld — fixed bases 0x10000000000 / 0x18000000000
+
+Example:
+  axcc -o hello.elf hello.c
+  axcc -c hello.c -o hello.o
+  axcc hello.o -o hello.elf
+
+Flags are forwarded to x86_64-elf-gcc; axiome defaults are injected:
+  -ffreestanding -nostdlib -nostartfiles -fno-builtin -fno-stack-protector
+  -fPIC (for libs) / -fpie (for apps) -mno-red-zone -mcmodel=small -O2 -pipe
+
+This is the GCC frontend; see axtcc for the TinyCC frontend.
+"""
+import os
+import sys
+import subprocess
+import pathlib
+import tempfile
+import shutil
+
+SDK = pathlib.Path(__file__).resolve().parents[1] / "sdk"
+INCLUDE = SDK / "include"
+LIB = SDK / "lib"
+LDSCRIPT = SDK / "ldscripts" / "link.ld"
+
+def find_cc():
+    import shutil
+    for name in ["x86_64-elf-gcc"]:
+        p = shutil.which(name)
+        if p:
+            return p
+    for p in [os.path.join(os.environ.get("HOME", ""), "opt/cross/bin/x86_64-elf-gcc"),
+              "/usr/local/bin/x86_64-elf-gcc",
+              "/opt/cross/bin/x86_64-elf-gcc"]:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return "gcc"
+
+def find_ld():
+    import shutil
+    for name in ["x86_64-elf-ld"]:
+        p = shutil.which(name)
+        if p and "x86_64-elf" in p:
+            return p
+    for p in [os.path.join(os.environ.get("HOME", ""), "opt/cross/bin/x86_64-elf-ld"),
+              "/usr/local/bin/x86_64-elf-ld"]:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return "ld"
+
+AX_BASE_CFLAGS = [
+    "-ffreestanding", "-nostdlib", "-nostartfiles",
+    "-fno-builtin", "-fno-stack-protector",
+    "-mno-red-zone", "-mcmodel=small",
+    "-O2", "-g", "-pipe",
+    "-Wall", "-Wextra",
+    f"-I{INCLUDE}",
+]
+AX_APP_CFLAGS = ["-fpie"] + AX_BASE_CFLAGS
+AX_LIB_CFLAGS = AX_BASE_CFLAGS  # -fPIC already in base? ensure -fPIC
+# ensure PIC for base: add -fPIC if not already pie-specific
+if "-fPIC" not in AX_BASE_CFLAGS and "-fpic" not in AX_BASE_CFLAGS:
+    AX_LIB_CFLAGS = ["-fPIC"] + AX_BASE_CFLAGS
+    AX_APP_CFLAGS = ["-fpie", "-fPIC"] + AX_BASE_CFLAGS  # keep both compat
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "-help"):
+        print(__doc__)
+        sys.exit(0)
+
+    cc = find_cc()
+    # parse simple
+    has_c = "-c" in args
+    has_S = "-S" in args
+    has_E = "-E" in args
+    # output file
+    out = None
+    if "-o" in args:
+        try:
+            out = args[args.index("-o")+1]
+        except:
+            pass
+    else:
+        if has_c:
+            # default .o name derived from first .c
+            for a in args:
+                if a.endswith(".c"):
+                    out = os.path.splitext(os.path.basename(a))[0] + ".o"
+                    break
+            if not out:
+                out = "a.o"
+        else:
+            out = "a.out"
+
+    # Separate compile vs link
+    # For compile-only, just invoke CC with proper flags
+    if has_c or has_S or has_E:
+        cmd = [cc] + AX_APP_CFLAGS
+        # if user gave -I, keep it; our -I is already included
+        cmd += args
+        # ensure -o is present
+        if "-o" not in args:
+            cmd += ["-o", out]
+        print(f"axcc: {' '.join(cmd)}", file=sys.stderr)
+        ret = subprocess.run(cmd)
+        sys.exit(ret.returncode)
+
+    # Link path: need to handle .c and .o inputs together.
+    # Strategy: compile .c files to temp .o, then link.
+    c_files = [a for a in args if a.endswith(".c")]
+    o_files = [a for a in args if a.endswith(".o")]
+    other = [a for a in args if a not in c_files and a not in o_files and a not in ("-o", out)]
+    # filter -o and its value from other
+    filtered = []
+    skip=False
+    for a in args:
+        if skip:
+            skip=False
+            continue
+        if a=="-o":
+            skip=True
+            continue
+        if a in c_files or a in o_files:
+            continue
+        filtered.append(a)
+
+    tmpdir = None
+    objs = list(o_files)
+    if c_files:
+        tmpdir = tempfile.mkdtemp(prefix="axcc-")
+        for cf in c_files:
+            obj = os.path.join(tmpdir, os.path.basename(cf).replace(".c", ".o"))
+            cmd = [cc] + AX_APP_CFLAGS + ["-c", cf, "-o", obj]
+            # propagate -D/-I etc
+            for f in filtered:
+                if f.startswith("-D") or f.startswith("-I"):
+                    cmd.insert(-3, f)
+            print(f"axcc: {' '.join(cmd)}", file=sys.stderr)
+            ret = subprocess.run(cmd)
+            if ret.returncode != 0:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                sys.exit(ret.returncode)
+            objs.append(obj)
+
+    # Now link
+    ld = find_ld()
+    # Use axld wrapper if available for consistent flags, else direct ld invocation
+    axld_path = pathlib.Path(__file__).resolve().parent / "axld"
+    if axld_path.exists():
+        cmd = [str(axld_path), "-o", out] + objs + [str(LIB / "crt0.o"), str(LIB / "libc.sl")]
+        # pass through remaining flags except -I/-D already handled
+        for f in filtered:
+            if not f.startswith("-I") and not f.startswith("-D"):
+                cmd.append(f)
+        print(f"axcc: {' '.join(cmd)}", file=sys.stderr)
+        ret = subprocess.run(cmd)
+    else:
+        # direct ld
+        if "x86_64-elf" not in ld:
+            cmd = [ld, "-m", "elf_x86_64"]
+        else:
+            cmd = [ld]
+        cmd += ["-pie", "-T", str(LDSCRIPT), "--hash-style=sysv", "-z", "max-page-size=0x1000", "-e", "_start", "-o", out, str(LIB / "crt0.o")] + objs + [str(LIB / "libc.sl")]
+        print(f"axcc: {' '.join(cmd)}", file=sys.stderr)
+        ret = subprocess.run(cmd)
+
+    if tmpdir:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    sys.exit(ret.returncode)
+
+if __name__ == "__main__":
+    main()

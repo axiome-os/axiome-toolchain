@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""
+axld — AxiomeOS linker for user binaries.
+Wraps x86_64-elf-ld (or host ld) with AxiomeOS defaults:
+  -pie -T <sdk>/ldscripts/link.ld --hash-style=sysv -z max-page-size=0x1000 -e _start
+
+Produces PIE ELFs loadable by kernel/elf.c + kernel/dynlink.c at
+  base 0x10000000000 (apps) / 0x18000000000 (libc.sl).
+
+This linker is part of the AxiomeOS SDK and does NOT require an
+axiomeOS checkout — all needed ldscripts are vendored in sdk/ldscripts.
+
+Usage:
+  axld -o prog.elf prog.o [crt0.o] [--] [options]
+  axld prog.o -o prog.elf
+  Any unknown flags are forwarded to the underlying ld.
+
+If -T is not given, defaults to sdk/ldscripts/link.ld.
+If -o is missing, defaults to a.out.
+If --hash-style / -z / -pie not explicitly set, axiome defaults are added.
+"""
+
+import os
+import sys
+import subprocess
+import pathlib
+
+SDK_ROOT = pathlib.Path(__file__).resolve().parents[1] / "sdk"
+DEFAULT_SCRIPT = SDK_ROOT / "ldscripts" / "link.ld"
+LIBC_SCRIPT = SDK_ROOT / "ldscripts" / "libc.ld"
+
+def find_ld():
+    import shutil
+    # Prefer cross toolchain in PATH
+    for name in ["x86_64-elf-ld"]:
+        p = shutil.which(name)
+        if p and "x86_64-elf" in p:
+            return p
+    candidates = [
+        os.path.join(os.environ.get("HOME", ""), "opt/cross/bin/x86_64-elf-ld"),
+        "/usr/local/bin/x86_64-elf-ld",
+        "/opt/cross/bin/x86_64-elf-ld",
+    ]
+    for p in candidates:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    # fallback to host ld with emulation flag
+    for p in ["/usr/bin/ld", "/usr/bin/ld.bfd"]:
+        if os.path.isfile(p):
+            return p
+    return "ld"
+
+def main():
+    args = sys.argv[1:]
+    if not args or "-h" in args or "--help" in args:
+        print(__doc__)
+        print(f"default script: {DEFAULT_SCRIPT}")
+        print(f"ld found: {find_ld()}")
+        sys.exit(0)
+
+    ld = find_ld()
+    ld_cmd = [ld]
+
+    # Detect host ld needs -m
+    if "x86_64-elf" not in ld:
+        ld_cmd += ["-m", "elf_x86_64"]
+
+    has_T = any(a.startswith("-T") or a == "-T" for a in args)
+    has_o = "-o" in args
+    has_pie = "-pie" in args or "--pie" in args
+    has_hash = any("hash-style" in a for a in args)
+    has_z = any(a.startswith("-z") or a == "-z" for a in args)
+    has_e = "-e" in args
+
+    # output handling
+    out = None
+    if has_o:
+        try:
+            idx = args.index("-o")
+            out = args[idx+1]
+        except:
+            pass
+    else:
+        out = "a.out"
+        ld_cmd += ["-o", out]
+
+    # forward original args
+    # Note: we inject defaults BEFORE user args so user can override if needed,
+    # but we add them after -o handling above? Simpler: prepend defaults.
+    pre = []
+    if not has_T:
+        # Use default link.ld unless user builds libc.sl explicitly (heuristic: if output is libc.sl)
+        if out and "libc" in out:
+            pre += ["-T", str(LIBC_SCRIPT)]
+        else:
+            pre += ["-T", str(DEFAULT_SCRIPT)]
+    if not has_pie:
+        # For libc we want -shared, but our wrapper detects that by checking -shared in args
+        if "-shared" not in args:
+            pre += ["-pie"]
+    if not has_hash:
+        pre += ["--hash-style=sysv"]
+    if not has_z:
+        pre += ["-z", "max-page-size=0x1000"]
+    if not has_e and "-shared" not in args:
+        pre += ["-e", "_start"]
+
+    # compose full command
+    # put pre before user args, but after ld's -m
+    # If we already injected -o a.out, remove duplicate?
+    # Rebuild: ld_cmd already has -o a.out if needed, so filter user -o
+    final = ld_cmd + pre + args
+    # If we auto-added -o a.out, and user also had no -o, we already added; but if user had -o we didn't add, so fine.
+    # However if we added -o a.out automatically, we shouldn't also have it in args (args has no -o). So fine.
+
+    print(f"axld: { ' '.join(final) }", file=sys.stderr)
+    try:
+        ret = subprocess.run(final)
+        sys.exit(ret.returncode)
+    except FileNotFoundError as e:
+        print(f"axld: linker not found: {ld}: {e}", file=sys.stderr)
+        sys.exit(127)
+
+if __name__ == "__main__":
+    main()

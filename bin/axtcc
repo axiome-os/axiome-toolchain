@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""
+axtcc — AxiomeOS TinyCC port.
+Provides a TCC-compatible compiler driver that emits AxiomeOS ELFs.
+
+This is the "TCC port" for AxiomeOS: a thin driver around the real TinyCC
+binary (vendored in sdk/tcc-host/bin/tcc) plus fallback to GCC for robustness.
+
+SDK is self-contained (sdk/include, sdk/lib, sdk/ldscripts) so building
+does NOT require an axiomeOS checkout — the SDK was vendored from
+the axiomeOS repository at release time.
+
+ABI matches kernel expectations:
+  - PIE ET_DYN at 0x10000000000 (apps)
+  - libc.sl at 0x18000000000 (shared, DT_NEEDED)
+  - hash-style SYSV, 4K pages, _start entry
+
+Usage (TCC-compatible):
+  axtcc -c hello.c -o hello.o
+  axtcc -o hello.elf hello.c          # compile+link
+  axtcc -o hello.elf hello.o crt
+  axtcc -run hello.c                  # immediate run on host via tcc -run (dev)
+  axtcc --help
+
+Internally:
+  - compile: tries tcc first (fast), falls back to axcc/gcc on failure.
+  - link: delegates to axld (which wraps x86_64-elf-ld) so output is always
+          AxiomeOS-compatible even if TCC's internal linker is used.
+
+Install:
+  bin/axtcc is installed as bin/tcc for drop-in compatibility.
+"""
+import os
+import sys
+import subprocess
+import pathlib
+import tempfile
+import shutil
+
+HERE = pathlib.Path(__file__).resolve().parent
+SDK = (HERE / ".." / "sdk").resolve()
+INCLUDE = SDK / "include"
+TCC_HOST_BIN = SDK / "tcc-host" / "bin" / "tcc"
+TCC_HOST_INCLUDE = SDK / "tcc-host" / "include"
+LIB = SDK / "lib"
+AXLD = HERE / "axld"
+
+def find_tcc():
+    if TCC_HOST_BIN.exists() and os.access(TCC_HOST_BIN, os.X_OK):
+        return str(TCC_HOST_BIN)
+    for p in ["/usr/bin/tcc", "/usr/local/bin/tcc"]:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+def find_gcc():
+    import shutil
+    for name in ["x86_64-elf-gcc"]:
+        p = shutil.which(name)
+        if p:
+            return p
+    for p in [os.path.join(os.environ.get("HOME", ""), "opt/cross/bin/x86_64-elf-gcc"),
+              "/usr/local/bin/x86_64-elf-gcc"]:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return "gcc"
+
+AX_TCC_CFLAGS = [
+    "-g", "-O2",
+    # Axiome freestanding; TCC ignores unknown -m flags gracefully
+]
+
+def tcc_compile(tcc_bin, src, obj, extra_args):
+    # Try TCC compile. Keep host includes for stdint/stddef, but prefer SDK.
+    cmd = [tcc_bin, "-c",
+           f"-I{INCLUDE}",
+           f"-I{TCC_HOST_INCLUDE}",
+           "-D__axiome__", "-D__x86_64__",
+           src, "-o", obj]
+    # propagate -D/-I from user? include will double but ok
+    for a in extra_args:
+        if a.startswith("-D") or a.startswith("-I") or a.startswith("-U"):
+            cmd.insert(-3, a)
+    print(f"axtcc[tcc]: {' '.join(cmd)}", file=sys.stderr)
+    return subprocess.run(cmd)
+
+def gcc_compile(gcc_bin, src, obj, extra_args):
+    base = ["-ffreestanding","-nostdlib","-nostartfiles","-fno-builtin","-fno-stack-protector",
+            "-fpie","-fPIC","-mno-red-zone","-mcmodel=small","-O2","-g","-pipe","-Wall",f"-I{INCLUDE}"]
+    cmd = [gcc_bin] + base + ["-c", src, "-o", obj]
+    for a in extra_args:
+        if a.startswith("-D") or a.startswith("-I") or a.startswith("-U"):
+            cmd.insert(-3, a)
+    print(f"axtcc[gcc]: {' '.join(cmd)}", file=sys.stderr)
+    return subprocess.run(cmd)
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("--help","-h","-help"):
+        print(__doc__)
+        # also show tcc version if available
+        tcc = find_tcc()
+        if tcc:
+            subprocess.run([tcc, "-v"])
+        sys.exit(0)
+    if argv[0] == "-v" or argv[0] == "--version":
+        tcc = find_tcc()
+        if tcc:
+            subprocess.run([tcc, "-v"])
+        else:
+            print("axtcc: no TCC binary, fallback GCC", file=sys.stderr)
+            subprocess.run([find_gcc(), "--version"])
+        print("axtcc: AxiomeOS TCC port (SDK at {})".format(SDK))
+        sys.exit(0)
+
+    # handle -run (TCC host run) — not axiome, just passthrough
+    if "-run" in argv:
+        tcc = find_tcc()
+        if not tcc:
+            print("axtcc: -run requires TCC binary", file=sys.stderr)
+            sys.exit(1)
+        cmd = [tcc] + argv
+        # inject SDK include for -run as well
+        if f"-I{INCLUDE}" not in cmd:
+            cmd.insert(1, f"-I{INCLUDE}")
+        print(f"axtcc[run]: {' '.join(cmd)}", file=sys.stderr)
+        ret = subprocess.run(cmd)
+        sys.exit(ret.returncode)
+
+    has_c = "-c" in argv
+    has_o = "-o" in argv
+    out = None
+    if has_o:
+        try:
+            out = argv[argv.index("-o")+1]
+        except:
+            pass
+    # Collect sources
+    c_files = [a for a in argv if a.endswith(".c")]
+    o_files = [a for a in argv if a.endswith(".o")]
+    # For compile-only, handle each c_file separately to mimic tcc
+    tcc_bin = find_tcc()
+    gcc_bin = find_gcc()
+
+    if has_c:
+        # tcc -c with single or multiple inputs: each produces .o
+        # Determine output path handling: tcc expects -o only with single input; for multiple it may not.
+        # Simplify: for each .c, compile individually.
+        rc = 0
+        for cf in c_files:
+            # decide output name
+            if len(c_files)==1 and out:
+                obj = out
+            else:
+                obj = os.path.splitext(os.path.basename(cf))[0] + ".o"
+                # if out given and single file handled above, else ignore -o for multi
+            ret = None
+            if tcc_bin:
+                ret = tcc_compile(tcc_bin, cf, obj, argv)
+                if ret.returncode != 0:
+                    print(f"axtcc: tcc failed for {cf} (code {ret.returncode}), trying gcc fallback", file=sys.stderr)
+                    ret = gcc_compile(gcc_bin, cf, obj, argv)
+            else:
+                ret = gcc_compile(gcc_bin, cf, obj, argv)
+            if ret.returncode != 0:
+                sys.exit(ret.returncode)
+        # If there are pre-existing .o files with -c, nothing to link
+        sys.exit(0)
+
+    # Link mode: compile C files to temp objects then link via axld
+    tmpdir = tempfile.mkdtemp(prefix="axtcc-")
+    objs = list(o_files)
+    # compile C files
+    for cf in c_files:
+        obj = os.path.join(tmpdir, os.path.basename(cf).replace(".c",".o"))
+        ret = None
+        if tcc_bin:
+            ret = tcc_compile(tcc_bin, cf, obj, argv)
+            if ret.returncode != 0:
+                print(f"axtcc: tcc failed for {cf}, fallback gcc", file=sys.stderr)
+                ret = gcc_compile(gcc_bin, cf, obj, argv)
+        else:
+            ret = gcc_compile(gcc_bin, cf, obj, argv)
+        if ret.returncode != 0:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            sys.exit(ret.returncode)
+        objs.append(obj)
+
+    if not out:
+        out = "a.out"
+    # Delegate link to axld wrapper for axiome-correct flags
+    # axld will add crt0 and libc.sl automatically? No, axld currently expects pure ld args.
+    # But our high-level drivers (axcc) explicitly add them. Here we mimic axcc behavior:
+    # add SDK crt0 and libc.sl unless -nostdlib present.
+    nostdlib = "-nostdlib" in argv
+    if AXLD.exists() and os.access(AXLD, os.X_OK):
+        cmd = [str(AXLD), "-o", out] + objs
+        if not nostdlib:
+            cmd += [str(LIB/"crt0.o"), str(LIB/"libc.sl")]
+        # forward -L/-l etc but not -I/-D
+        for a in argv:
+            if a in ("-o", out) or a.endswith(".c") or a.endswith(".o"):
+                continue
+            if a.startswith("-I") or a.startswith("-D"):
+                continue
+            if a=="-c":
+                continue
+            cmd.append(a)
+        print(f"axtcc[ld]: {' '.join(cmd)}", file=sys.stderr)
+        ret = subprocess.run(cmd)
+    else:
+        # fallback direct ld
+        ld = shutil.which("x86_64-elf-ld")
+        if not ld or not os.path.isfile(ld):
+            ld = os.path.join(os.environ.get("HOME", ""), "opt/cross/bin/x86_64-elf-ld")
+        if not os.path.isfile(ld):
+            ld = "ld"
+        cmd = [ld]
+        if "x86_64-elf" not in ld:
+            cmd += ["-m","elf_x86_64"]
+        cmd += ["-pie","-T", str(SDK/"ldscripts"/"link.ld"), "--hash-style=sysv","-z","max-page-size=0x1000","-e","_start","-o",out]
+        if not nostdlib:
+            cmd += [str(LIB/"crt0.o")]
+        cmd += objs
+        if not nostdlib:
+            cmd += [str(LIB/"libc.sl")]
+        print(f"axtcc[ld-direct]: {' '.join(cmd)}", file=sys.stderr)
+        ret = subprocess.run(cmd)
+
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    sys.exit(ret.returncode)
+
+if __name__ == "__main__":
+    main()

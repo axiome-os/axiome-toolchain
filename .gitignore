@@ -1,0 +1,50 @@
+# Build output (regenerated via `make libs` / `make examples`)
+build/
+dist/
+*.tar.gz
+axiome-toolchain-*.tar.gz
+
+# Generated ELF / object files outside vendored SDK
+*.elf
+*.o
+*.kxt
+
+# Disk / ISO images if tested locally
+*.iso
+*.img
+disk.img
+axfs.img
+ovmf_vars.fd
+
+# TCC source clone (built in /tmp, not in repo) — top-level only
+/tcc/
+/tcc-src/
+
+# Keep vendored SDK prebuilts (needed for offline SDK — must be after ignores)
+!sdk/lib/crt0.o
+!sdk/lib/libc.sl
+!sdk/tcc-host/bin/tcc
+!sdk/tcc-host/lib/tcc/libtcc1.a
+
+# Editor / OS artefacts
+*.swp
+*~
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.code-workspace
+
+# Dependency / cache
+__pycache__/
+*.pyc
+*.pyo
+.cache/
+
+# Local toolchain overrides
+.env
+cross/
+
+# Docs generated
+DOCS/NESTED.TXT
+osdev_wiki/
